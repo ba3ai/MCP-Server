@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>QBO MCP Dashboard</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui; margin: 24px; background:#0b0f19; color:#e6e8ef; }
+    a { color:#9ad1ff; }
+    .top { display:flex; justify-content:space-between; align-items:center; margin-bottom: 18px; }
+    .card { background:#121a2a; border: 1px solid #1f2a44; border-radius: 14px; padding: 16px; margin: 14px 0; }
+    .btn { display:inline-block; padding:10px 14px; border-radius: 12px; border: 1px solid #2b3b63; background:#0f1730; text-decoration:none; }
+    .btn:hover { background:#142048; }
+    .muted { color:#9aa6c0; }
+    table { width:100%; border-collapse: collapse; }
+    td, th { padding: 10px; border-bottom: 1px solid #1f2a44; text-align:left; }
+    code { background:#0f1730; padding:2px 6px; border-radius:8px; }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div>
+      <h1 style="margin:0;">QBO MCP Server</h1>
+      <div class="muted">Signed in as: {{ user.name or user.email or user.sub }}</div>
+    </div>
+    <div><a class="btn" href="/ui/logout">Logout</a></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Step 1: Connect QuickBooks</h3>
+    <p class="muted">Connect a client/company (realmId) via Intuit OAuth. Repeat for each client company.</p>
+    <a class="btn" href="/ui/connect-qbo">Connect QBO Company</a>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Connected Companies</h3>
+    {% if companies and companies|length > 0 %}
+      <table>
+        <thead><tr><th>Realm ID</th><th>Company Name</th><th>Updated</th></tr></thead>
+        <tbody>
+          {% for c in companies %}
+            <tr>
+              <td><code>{{ c.realm_id }}</code></td>
+              <td>{{ c.company_name or "-" }}</td>
+              <td class="muted">{{ c.updated_at }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">No companies connected yet.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Step 2: Use in ChatGPT</h3>
+    <p>In ChatGPT Developer Mode, add your MCP server URL:</p>
+    <p><code>{{ mcp_url }}</code></p>
+    <a class="btn" href="/ui/mcp">View detailed instructions</a>
+  </div>
+</body>
+</html>
