@@ -22,7 +22,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-mcp = FastMCP("QBO MCP Server (OAuth + UI)")
+# NOTE: ChatGPT Apps / Custom Connectors require *stateless* HTTP mode for the
+# HTTP/SSE transport expected by the client.
+mcp = FastMCP("QBO MCP Server (OAuth + UI)", stateless_http=True)
 
 
 def _user_id() -> str:
