@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 
@@ -21,7 +23,12 @@ from app.mcp_app import mcp
 
 load_dotenv()
 
-app = FastAPI()
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("qbo_mcp")
+
+# NOTE: Avoid auto-redirects (307) caused by missing/extra trailing slashes.
+# Some clients drop the Authorization header when following redirects.
+app = FastAPI(redirect_slashes=False)
 
 app.add_middleware(
     SessionMiddleware,
@@ -254,6 +261,55 @@ class MCPHttpOAuthWrapper:
     def __init__(self, asgi_app: Any):
         self._app = asgi_app
 
+    @staticmethod
+    def _extract_jsonrpc_method(body: bytes) -> Optional[str]:
+        """Best-effort extraction of JSON-RPC method from an MCP request body."""
+        if not body:
+            return None
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            return None
+
+        # JSON-RPC batch or single.
+        if isinstance(payload, list) and payload:
+            payload = payload[0]
+        if isinstance(payload, dict):
+            m = payload.get("method")
+            return str(m) if m else None
+        return None
+
+    class _BodyBuffer:
+        """Buffer the ASGI body so it can be read and then replayed."""
+
+        def __init__(self, receive):
+            self._receive = receive
+            self._body: Optional[bytes] = None
+            self._queue: Optional[list] = None
+
+        async def body(self) -> bytes:
+            if self._body is not None:
+                return self._body
+            chunks: list[bytes] = []
+            more = True
+            while more:
+                message = await self._receive()
+                if message.get("type") != "http.request":
+                    continue
+                chunks.append(message.get("body", b""))
+                more = bool(message.get("more_body", False))
+            self._body = b"".join(chunks)
+            self._queue = [{"type": "http.request", "body": self._body, "more_body": False}]
+            return self._body
+
+        async def replay(self):
+            # If we never read the body, just pass through.
+            if self._queue is None:
+                return await self._receive()
+            if self._queue:
+                return self._queue.pop(0)
+            return {"type": "http.request", "body": b"", "more_body": False}
+
     def _challenge_headers(self, scope: Dict[str, Any]) -> Dict[str, str]:
         # Build an absolute resource metadata URL when possible.
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in (scope.get("headers") or [])}
@@ -285,6 +341,8 @@ class MCPHttpOAuthWrapper:
             await self._app(scope, receive, send)
             return
 
+        body_buf = self._BodyBuffer(receive)
+
         path = (scope.get("path") or "").rstrip("/")
 
         # Enforce OAuth only for MCP transport endpoints.
@@ -295,6 +353,19 @@ class MCPHttpOAuthWrapper:
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in (scope.get("headers") or [])}
         auth = headers.get("authorization")
+
+        # Some hosts fetch the tool list for UI display without attaching an
+        # access token. Tool discovery is safe to expose publicly.
+        allow_public_discovery = os.environ.get("ALLOW_PUBLIC_DISCOVERY", "1").lower() in {"1", "true", "yes"}
+        if allow_public_discovery and (not auth or not auth.lower().startswith("bearer ")) and path.startswith("/mcp"):
+            try:
+                method = self._extract_jsonrpc_method(await body_buf.body())
+                if method in {"initialize", "tools/list", "resources/list", "prompts/list"}:
+                    await self._app(scope, body_buf.replay, send)
+                    return
+            except Exception:
+                # Fall back to normal auth enforcement.
+                pass
 
         # The token's audience/resource MUST match the MCP URL the client uses.
         # Compute the expected resource from the request headers.
@@ -318,6 +389,7 @@ class MCPHttpOAuthWrapper:
         try:
             claims = await verify_bearer_token(auth, audience=expected_resource)
         except PermissionError as e:
+            logger.info("MCP auth rejected: path=%s expected_audience=%s reason=%s", path, expected_resource, str(e))
             resp = JSONResponse(
                 {"error": "unauthorized", "error_description": str(e)},
                 status_code=401,
@@ -326,13 +398,18 @@ class MCPHttpOAuthWrapper:
             await resp(scope, receive, send)
             return
         except Exception as e:
+            logger.exception("Unexpected OAuth verification error")
             resp = JSONResponse({"error": f"OAuth verify error: {e}"}, status_code=500)
             await resp(scope, receive, send)
             return
 
         # Attach user context for tool handlers.
-        current_user.set({"sub": claims.get("sub"), "email": claims.get("email")})
-        await self._app(scope, receive, send)
+        token = current_user.set({"sub": claims.get("sub"), "email": claims.get("email")})
+        try:
+            await self._app(scope, body_buf.replay, send)
+        finally:
+            # Avoid leaking identity across requests.
+            current_user.reset(token)
 
 
 # ---------------------------------------------------------------------------
