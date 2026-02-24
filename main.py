@@ -366,7 +366,7 @@ class MCPHttpOAuthWrapper:
         allow_public_discovery = os.environ.get("ALLOW_PUBLIC_DISCOVERY", "1").lower() in {"1", "true", "yes"}
         if allow_public_discovery and (not auth or not auth.lower().startswith("bearer ")) and path.startswith("/mcp"):
             try:
-                methods = self._extract_jsonrpc_methodss(await body_buf.body())
+                methods = self._extract_jsonrpc_methods(await body_buf.body())
 
                 # Only allow a small, safe subset of MCP methods without OAuth.
                 # IMPORTANT: Handle JSON-RPC batches safely (every method in the
