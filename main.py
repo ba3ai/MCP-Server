@@ -138,8 +138,10 @@ def _registration_endpoint() -> Optional[str]:
 
 
 def _supported_scopes() -> list[str]:
-    # MCP examples often use read/write. Adjust to your needs.
-    raw = os.environ.get("OAUTH_SCOPES", "read write")
+    # ChatGPT's OAuth client can be strict about requested vs. granted scopes.
+    # Prefer standard OIDC scopes by default unless you explicitly configure
+    # custom scopes in your IdP.
+    raw = os.environ.get("OAUTH_SCOPES", "openid profile email offline_access")
     return [s for s in raw.replace(",", " ").split() if s]
 
 
@@ -158,22 +160,37 @@ def _public_base_url_from_request(request: Request) -> str:
     return ""
 
 
+def _resource_url(request: Request) -> str:
+    """Return the resource identifier (RFC 9728) for this MCP server.
+
+    IMPORTANT: The `resource` MUST match the MCP server URL that the client
+    configured (e.g. https://host/mcp). Many MCP clients validate this.
+    """
+
+    # If explicitly configured, trust the env value.
+    resource = os.environ.get("OAUTH_RESOURCE")
+    if resource:
+        return resource.rstrip("/")
+
+    base = _public_base_url_from_request(request).rstrip("/")
+    # Our MCP endpoint is /mcp (served by the FastMCP HTTP transport).
+    return f"{base}/mcp" if base else "/mcp"
+
+
 @app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/mcp")
 def oauth_protected_resource(request: Request):
     """Protected Resource Metadata (RFC 9728).
 
     ChatGPT uses this to discover your authorization server(s) and scopes.
     """
-    resource = os.environ.get("OAUTH_RESOURCE")
-    if not resource:
-        resource = _public_base_url_from_request(request)
-
     issuer = _normalized_issuer_from_env()
 
     return {
-        "resource": resource,
+        "resource": _resource_url(request),
         "authorization_servers": [issuer] if issuer else [],
         "scopes_supported": _supported_scopes(),
+        "bearer_methods_supported": ["header"],
         "resource_documentation": os.environ.get("RESOURCE_DOCUMENTATION"),
     }
 
@@ -250,7 +267,11 @@ class MCPHttpOAuthWrapper:
         else:
             base = ""
 
-        resource_metadata_url = f"{base}/.well-known/oauth-protected-resource" if base else "/.well-known/oauth-protected-resource"
+        # Prefer root metadata URL. We also serve a path-qualified variant at
+        # /.well-known/oauth-protected-resource/mcp for compatibility.
+        resource_metadata_url = (
+            f"{base}/.well-known/oauth-protected-resource" if base else "/.well-known/oauth-protected-resource"
+        )
         scope_str = " ".join(_supported_scopes())
 
         www_auth = f'Bearer resource_metadata="{resource_metadata_url}"'
@@ -264,22 +285,38 @@ class MCPHttpOAuthWrapper:
             await self._app(scope, receive, send)
             return
 
-        method = (scope.get("method") or "").upper()
+        path = (scope.get("path") or "").rstrip("/")
 
-        # Some clients probe with GET/HEAD.
-        if method in ("GET", "HEAD"):
-            resp = JSONResponse(
-                {"ok": True, "service": "QBO MCP Server (OAuth + UI)", "auth": "oauth", "ui": "/ui"},
-                status_code=200,
-            )
-            await resp(scope, receive, send)
+        # Enforce OAuth only for MCP transport endpoints.
+        # (The FastMCP HTTP transport exposes /mcp and, in stateless mode, /sse.)
+        if not (path == "/mcp" or path.startswith("/mcp/") or path == "/sse" or path.startswith("/sse/")):
+            await self._app(scope, receive, send)
             return
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in (scope.get("headers") or [])}
         auth = headers.get("authorization")
 
+        # The token's audience/resource MUST match the MCP URL the client uses.
+        # Compute the expected resource from the request headers.
+        expected_resource = None
         try:
-            claims = await verify_bearer_token(auth)
+            # Reuse logic from _challenge_headers.
+            hdrs = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in (scope.get("headers") or [])}
+            proto = hdrs.get("x-forwarded-proto") or scope.get("scheme") or "https"
+            host = hdrs.get("x-forwarded-host") or hdrs.get("host")
+            base = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+            if base:
+                base = base.rstrip("/")
+            elif host:
+                base = f"{proto}://{host}".rstrip("/")
+            else:
+                base = ""
+            expected_resource = os.environ.get("OAUTH_RESOURCE") or (f"{base}/mcp" if base else None)
+        except Exception:
+            expected_resource = os.environ.get("OAUTH_RESOURCE")
+
+        try:
+            claims = await verify_bearer_token(auth, audience=expected_resource)
         except PermissionError as e:
             resp = JSONResponse(
                 {"error": "unauthorized", "error_description": str(e)},
@@ -298,4 +335,12 @@ class MCPHttpOAuthWrapper:
         await self._app(scope, receive, send)
 
 
-app.mount("/mcp", MCPHttpOAuthWrapper(mcp.streamable_http_app()))
+# ---------------------------------------------------------------------------
+# MCP transport mounting
+#
+# IMPORTANT: FastMCP's HTTP transport already exposes the /mcp (and /sse) paths.
+# Mount it at the root and let FastAPI's explicit routes above take precedence.
+# This avoids /mcp -> /mcp/ redirects and "double /mcp" path issues.
+# ---------------------------------------------------------------------------
+
+app.mount("/", MCPHttpOAuthWrapper(mcp.streamable_http_app()))
