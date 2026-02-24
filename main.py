@@ -262,22 +262,29 @@ class MCPHttpOAuthWrapper:
         self._app = asgi_app
 
     @staticmethod
-    def _extract_jsonrpc_method(body: bytes) -> Optional[str]:
-        """Best-effort extraction of JSON-RPC method from an MCP request body."""
+    def _extract_jsonrpc_methods(body: bytes) -> list[str]:
+        """Best-effort extraction of JSON-RPC method(s) from an MCP request body.
+
+        Handles:
+        - single JSON-RPC request objects
+        - JSON-RPC batch requests (list of objects)
+        - notifications (no "id")
+        """
         if not body:
-            return None
+            return []
         try:
             payload = json.loads(body.decode("utf-8"))
         except Exception:
-            return None
+            return []
 
-        # JSON-RPC batch or single.
-        if isinstance(payload, list) and payload:
-            payload = payload[0]
-        if isinstance(payload, dict):
-            m = payload.get("method")
-            return str(m) if m else None
-        return None
+        msgs = payload if isinstance(payload, list) else [payload]
+        methods: list[str] = []
+        for msg in msgs:
+            if isinstance(msg, dict):
+                m = msg.get("method")
+                if m:
+                    methods.append(str(m))
+        return methods
 
     class _BodyBuffer:
         """Buffer the ASGI body so it can be read and then replayed."""
@@ -354,13 +361,22 @@ class MCPHttpOAuthWrapper:
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in (scope.get("headers") or [])}
         auth = headers.get("authorization")
 
-        # Some hosts fetch the tool list for UI display without attaching an
+        # Some hosts fetch MCP metadata / tool lists for UI display without attaching an
         # access token. Tool discovery is safe to expose publicly.
         allow_public_discovery = os.environ.get("ALLOW_PUBLIC_DISCOVERY", "1").lower() in {"1", "true", "yes"}
         if allow_public_discovery and (not auth or not auth.lower().startswith("bearer ")) and path.startswith("/mcp"):
             try:
-                method = self._extract_jsonrpc_method(await body_buf.body())
-                if method in {"initialize", "tools/list", "resources/list", "prompts/list"}:
+                methods = self._extract_jsonrpc_methodss(await body_buf.body())
+
+                # Only allow a small, safe subset of MCP methods without OAuth.
+                # IMPORTANT: Handle JSON-RPC batches safely (every method in the
+                # batch must be allow-listed) to avoid auth bypass.
+                public_methods = {"initialize", "tools/list", "resources/list", "prompts/list", "logging/setLevel", "ping"}
+
+                def _is_public_method(m: str) -> bool:
+                    return m in public_methods or m.startswith("notifications/")
+
+                if methods and all(_is_public_method(m) for m in methods):
                     await self._app(scope, body_buf.replay, send)
                     return
             except Exception:
