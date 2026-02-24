@@ -59,6 +59,19 @@ async def verify_bearer_token(auth_header: Optional[str], *, audience: Optional[
         raise PermissionError("Missing Bearer token")
 
     token = auth_header.split(" ", 1)[1].strip()
+
+    # Fast-path: Auth0 may return opaque access tokens (or JWE tokens) when the
+    # request doesn't indicate a resource/audience. MCP clients (including
+    # ChatGPT) generally expect a signed JWT access token for resource servers.
+    # JWTs have exactly 2 '.' separators.
+    if token.count(".") != 2:
+        raise PermissionError(
+            "Access token does not look like a signed JWT (it may be opaque or JWE-encrypted). "
+            "If you're using Auth0, create an API with identifier equal to your MCP resource URL "
+            "(e.g. https://<host>/mcp) and enable Auth0's Resource Parameter Compatibility Profile (Auth for MCP), "
+            "or set a Default Audience so Auth0 returns a JWT access token."
+        )
+
     jwks = await _get_jwks()
 
     try:
@@ -66,7 +79,8 @@ async def verify_bearer_token(auth_header: Optional[str], *, audience: Optional[
     except JWTError as e:
         # Common failure if Auth0 returns opaque tokens or encrypted JWE tokens.
         raise PermissionError(
-            "Access token is not a JWT. If using Auth0, ensure your API 'Default Audience' is set "
+            "Access token is not a JWT. If using Auth0, ensure your API identifier matches your MCP resource URL "
+            "and enable the Resource Parameter Compatibility Profile (Auth for MCP), or set a Default Audience "
             "(so Auth0 returns a signed JWT access token instead of an opaque/JWE token)."
         ) from e
 
