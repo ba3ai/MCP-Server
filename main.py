@@ -380,7 +380,6 @@ class MCPHttpOAuthWrapper:
         # Some hosts fetch MCP metadata / tool lists for UI display without attaching an
         # access token. Tool discovery is safe to expose publicly.
         if allow_public_discovery and (not auth or not auth.lower().startswith("bearer ")):
-        if allow_public_discovery and (not auth or not auth.lower().startswith("bearer ")) and path.startswith("/mcp"):
             try:
                 methods = self._extract_jsonrpc_methods(await body_buf.body())
 
