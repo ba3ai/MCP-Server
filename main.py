@@ -451,4 +451,5 @@ class MCPHttpOAuthWrapper:
 # This avoids /mcp -> /mcp/ redirects and "double /mcp" path issues.
 # ---------------------------------------------------------------------------
 
-app.mount("/mcp", MCPHttpOAuthWrapper(mcp.streamable_http_app()))
+# ✅ Correct
+app.mount("/", MCPHttpOAuthWrapper(mcp.streamable_http_app()))
