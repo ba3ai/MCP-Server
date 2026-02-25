@@ -4,6 +4,7 @@ import os
 import json
 import logging
 from datetime import datetime, timezone, timedelta
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
@@ -28,7 +29,16 @@ logger = logging.getLogger("qbo_mcp")
 
 # NOTE: Avoid auto-redirects (307) caused by missing/extra trailing slashes.
 # Some clients drop the Authorization header when following redirects.
-app = FastAPI(redirect_slashes=False)
+@asynccontextmanager
+async def lifespan(app_: FastAPI):
+    # Initialize FastMCP Streamable HTTP session manager.
+    # Without this, FastMCP raises: 'Task group is not initialized. Make sure to use run().' 
+    async with mcp.session_manager.run():
+        await init_db()
+        yield
+
+
+app = FastAPI(redirect_slashes=False, lifespan=lifespan)
 
 app.add_middleware(
     SessionMiddleware,
@@ -40,9 +50,6 @@ app.add_middleware(
 app.include_router(ui_router)
 
 
-@app.on_event("startup")
-async def _startup() -> None:
-    await init_db()
 
 
 @app.get("/")
