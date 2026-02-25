@@ -368,10 +368,10 @@ class MCPHttpOAuthWrapper:
 
         path = (scope.get("path") or "").rstrip("/")
 
-        # Enforce OAuth only for MCP transport endpoints.
-        # (The FastMCP HTTP transport exposes /mcp and, in stateless mode, /sse.)
-        if not (path == "/mcp" or path.startswith("/mcp/") or path == "/sse" or path.startswith("/sse/")):
-            await self._app(scope, receive, send)
+        # Some clients probe MCP with GET /mcp. Return a simple 200 instead of forcing OAuth.
+        if scope.get("method") == "GET" and (path == "" or path == "/"):
+            resp = JSONResponse({"ok": True, "message": "MCP endpoint. Use POST for JSON-RPC."})
+            await resp(scope, receive, send)
             return
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in (scope.get("headers") or [])}
@@ -379,7 +379,7 @@ class MCPHttpOAuthWrapper:
 
         # Some hosts fetch MCP metadata / tool lists for UI display without attaching an
         # access token. Tool discovery is safe to expose publicly.
-        allow_public_discovery = os.environ.get("ALLOW_PUBLIC_DISCOVERY", "1").lower() in {"1", "true", "yes"}
+        if allow_public_discovery and (not auth or not auth.lower().startswith("bearer ")):
         if allow_public_discovery and (not auth or not auth.lower().startswith("bearer ")) and path.startswith("/mcp"):
             try:
                 methods = self._extract_jsonrpc_methods(await body_buf.body())
@@ -452,4 +452,4 @@ class MCPHttpOAuthWrapper:
 # This avoids /mcp -> /mcp/ redirects and "double /mcp" path issues.
 # ---------------------------------------------------------------------------
 
-app.mount("/", MCPHttpOAuthWrapper(mcp.streamable_http_app()))
+app.mount("/mcp", MCPHttpOAuthWrapper(mcp.streamable_http_app()))
