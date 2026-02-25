@@ -21,6 +21,7 @@ from app import db
 from app.request_context import current_user
 from app.ui import router as ui_router
 from app.mcp_app import mcp
+from fastapi import Request
 load_dotenv()
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -50,7 +51,15 @@ app.add_middleware(
 app.include_router(ui_router)
 
 
-
+@app.get("/__debug")
+def __debug(request: Request):
+    return {
+        "host": request.headers.get("host"),
+        "x_forwarded_host": request.headers.get("x-forwarded-host"),
+        "x_forwarded_proto": request.headers.get("x-forwarded-proto"),
+        "render_git_commit": os.environ.get("RENDER_GIT_COMMIT"),
+        "marker": "MCP-SERVER-DEBUG-2026-02-25",
+    }
 
 @app.get("/")
 def root():
