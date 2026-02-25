@@ -21,6 +21,7 @@ from app import db
 from app.request_context import current_user
 from app.ui import router as ui_router
 from app.mcp_app import mcp
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 load_dotenv()
 
@@ -40,11 +41,16 @@ async def lifespan(app_: FastAPI):
 
 app = FastAPI(redirect_slashes=False, lifespan=lifespan)
 
+
 app.add_middleware(
-    SessionMiddleware,
-    secret_key=os.environ.get("SESSION_SECRET", "change-me"),
-    same_site="lax",
-    https_only=True,
+    TrustedHostMiddleware,
+    allowed_hosts=[
+        "mcp-server-wymi.onrender.com",
+        "*.onrender.com",
+        "localhost",
+        "127.0.0.1",
+        "*",  # debug quickest; prod এ চাইলে "*" বাদ দিতে পারেন
+    ],
 )
 
 app.include_router(ui_router)
