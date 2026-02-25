@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+import os
+from typing import Optional
+from urllib.parse import urlencode
+
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+OIDC_ISSUER = os.environ.get("OIDC_ISSUER", "").rstrip("/") + "/"
+OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID")
+OIDC_CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET")
+OIDC_REDIRECT_URI = os.environ.get("OIDC_REDIRECT_URI")
+OIDC_SCOPES = os.environ.get("OIDC_SCOPES", "openid profile email")
+OIDC_AUDIENCE = os.environ.get("OIDC_AUDIENCE")
+
+_discovery_cache = None
+
+
+async def oidc_discovery() -> dict:
+    global _discovery_cache
+    if _discovery_cache:
+        return _discovery_cache
+    if not OIDC_ISSUER or OIDC_ISSUER == "/":
+        raise RuntimeError("OIDC_ISSUER is not set")
+    url = f"{OIDC_ISSUER}.well-known/openid-configuration"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        _discovery_cache = r.json()
+        return _discovery_cache
+
+
+async def build_login_url(
+    state: str,
+    *,
+    code_challenge: Optional[str] = None,
+) -> str:
+    """Build an /authorize URL.
+
+    If code_challenge is provided, PKCE S256 parameters are added.
+    """
+    if not (OIDC_CLIENT_ID and OIDC_REDIRECT_URI):
+        raise RuntimeError("OIDC_CLIENT_ID / OIDC_REDIRECT_URI not set")
+
+    d = await oidc_discovery()
+    auth_endpoint = d["authorization_endpoint"]
+
+    params = {
+        "response_type": "code",
+        "client_id": OIDC_CLIENT_ID,
+        "redirect_uri": OIDC_REDIRECT_URI,
+        "scope": OIDC_SCOPES,
+        "state": state,
+    }
+
+    # Many IdPs (Auth0 included) can issue an API-scoped access token when you set an audience.
+    if OIDC_AUDIENCE:
+        params["audience"] = OIDC_AUDIENCE
+
+    if code_challenge:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = "S256"
+
+    return f"{auth_endpoint}?{urlencode(params)}"
+
+
+async def exchange_code_for_tokens(
+    code: str,
+    *,
+    code_verifier: Optional[str] = None,
+) -> dict:
+    """Exchange an authorization code for tokens.
+
+    Supports both confidential clients (client_secret) and public clients (PKCE).
+    """
+    if not (OIDC_CLIENT_ID and OIDC_REDIRECT_URI):
+        raise RuntimeError("OIDC_CLIENT_ID / OIDC_REDIRECT_URI not set")
+
+    d = await oidc_discovery()
+    token_endpoint = d["token_endpoint"]
+
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": OIDC_CLIENT_ID,
+        "redirect_uri": OIDC_REDIRECT_URI,
+        "code": code,
+    }
+
+    if OIDC_CLIENT_SECRET:
+        data["client_secret"] = OIDC_CLIENT_SECRET
+
+    if code_verifier:
+        data["code_verifier"] = code_verifier
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(token_endpoint, data=data, headers={"Accept": "application/json"})
+
+    if r.status_code >= 400:
+        # Return the provider's error body to make debugging much easier.
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise httpx.HTTPStatusError(
+            f"OIDC token exchange failed: {r.status_code} {detail}",
+            request=r.request,
+            response=r,
+        )
+
+    return r.json()
+
+
+async def fetch_userinfo(access_token: str) -> dict:
+    d = await oidc_discovery()
+    userinfo_endpoint = d.get("userinfo_endpoint")
+    if not userinfo_endpoint:
+        return {}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            userinfo_endpoint,
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+        )
+        r.raise_for_status()
+        return r.json()

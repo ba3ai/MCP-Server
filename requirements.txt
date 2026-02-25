@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+gunicorn
+httpx
+python-dotenv
+cryptography
+sqlalchemy>=2.0
+aiosqlite
+mcp
+python-jose[cryptography]
+jinja2
+itsdangerous
