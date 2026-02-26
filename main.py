@@ -51,6 +51,13 @@ app.add_middleware(
 app.include_router(ui_router)
 
 
+@app.middleware("http")
+async def log_host(request: Request, call_next):
+    print("DEBUG HOST:", request.headers.get("host"),
+          "XFH:", request.headers.get("x-forwarded-host"),
+          "XFP:", request.headers.get("x-forwarded-proto"))
+    return await call_next(request)
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "QBO MCP Server (OAuth + UI)", "ui": "/ui", "mcp": "/mcp"}
