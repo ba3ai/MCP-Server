@@ -22,6 +22,8 @@ from app import db
 from app.request_context import current_user
 from app.ui import router as ui_router
 from app.mcp_app import mcp
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 load_dotenv()
 
