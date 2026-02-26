@@ -24,6 +24,7 @@ from app.ui import router as ui_router
 from app.mcp_app import mcp
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+from app.qbo import qbo_query  # add import at top
 
 load_dotenv()
 
@@ -88,15 +89,28 @@ async def intuit_callback(code: str, realmId: str, state: str):
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
     user_id = state
 
+    # Fetch company name
+    company_name = None
+    try:
+        info = await qbo_query(realmId, access_token, "SELECT * FROM CompanyInfo")
+        company_name = (
+            info.get("QueryResponse", {})
+                .get("CompanyInfo", [{}])[0]
+                .get("CompanyName")
+        )
+    except Exception:
+        company_name = None
+
     await db.upsert_connection(
         user_id=user_id,
         realm_id=realmId,
-        company_name=None,
+        company_name=company_name,
         access_token_enc=encrypt(access_token),
         refresh_token_enc=encrypt(refresh_token),
         access_token_expires_at=expires_at,
     )
-    return JSONResponse({"connected": True, "realmId": realmId, "user_id": user_id})
+
+    return JSONResponse({"connected": True, "realmId": realmId, "company_name": company_name, "user_id": user_id})
 
 
 # ---------------------------------------------------------------------------
