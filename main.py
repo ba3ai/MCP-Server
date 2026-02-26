@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
+from starlette.responses import Response
 from starlette.middleware.sessions import SessionMiddleware
 
 from dotenv import load_dotenv
@@ -27,35 +28,29 @@ load_dotenv()
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("qbo_mcp")
 
-
-# -----------------------------------------------------------------------------
-# Lifespan: FastMCP Streamable HTTP requires session_manager.run()
-# -----------------------------------------------------------------------------
+# NOTE: Avoid auto-redirects (307) caused by missing/extra trailing slashes.
+# Some clients drop the Authorization header when following redirects.
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
+    # Initialize FastMCP Streamable HTTP session manager.
+    # Without this, FastMCP raises: 'Task group is not initialized. Make sure to use run().'
     async with mcp.session_manager.run():
         await init_db()
         yield
 
 
-# NOTE: Avoid auto-redirects (307) caused by missing/extra trailing slashes.
-# Some clients drop Authorization header when following redirects.
 app = FastAPI(redirect_slashes=False, lifespan=lifespan)
 
-# Sessions for /ui
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.environ.get("SESSION_SECRET", "change-me"),
     same_site="lax",
-    https_only=(os.environ.get("HTTPS_ONLY", "true").lower() in {"1", "true", "yes"}),
+    https_only=True,
 )
 
 app.include_router(ui_router)
 
 
-# -----------------------------------------------------------------------------
-# Basic routes
-# -----------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {"ok": True, "service": "QBO MCP Server (OAuth + UI)", "ui": "/ui", "mcp": "/mcp"}
@@ -66,9 +61,6 @@ def health():
     return {"ok": True}
 
 
-# -----------------------------------------------------------------------------
-# Intuit OAuth helpers (your existing flow)
-# -----------------------------------------------------------------------------
 @app.get("/intuit/connect")
 def intuit_connect(state: str):
     return RedirectResponse(build_intuit_auth_url(state=state))
@@ -94,10 +86,13 @@ async def intuit_callback(code: str, realmId: str, state: str):
     return JSONResponse({"connected": True, "realmId": realmId, "user_id": user_id})
 
 
-# -----------------------------------------------------------------------------
-# OAuth discovery endpoints (for ChatGPT Custom Connector OAuth mode)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# OAuth discovery endpoints (required for ChatGPT Custom Connector OAuth mode)
+# ---------------------------------------------------------------------------
+
+
 def _normalized_issuer_from_env() -> Optional[str]:
+    """Return issuer (with trailing slash if it's a domain-based issuer)."""
     issuer = os.environ.get("OIDC_ISSUER")
     if issuer:
         return issuer.rstrip("/") + "/"
@@ -155,11 +150,7 @@ def _supported_scopes() -> list[str]:
 
 
 def _public_base_url_from_request(request: Request) -> str:
-    env_url = (
-        os.environ.get("PUBLIC_BASE_URL")
-        or os.environ.get("BASE_URL")
-        or os.environ.get("RENDER_EXTERNAL_URL")
-    )
+    env_url = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
     if env_url:
         return env_url.rstrip("/")
 
@@ -167,6 +158,7 @@ def _public_base_url_from_request(request: Request) -> str:
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme
     if host:
         return f"{proto}://{host}".rstrip("/")
+
     return ""
 
 
@@ -174,6 +166,7 @@ def _resource_url(request: Request) -> str:
     resource = os.environ.get("OAUTH_RESOURCE")
     if resource:
         return resource.rstrip("/")
+
     base = _public_base_url_from_request(request).rstrip("/")
     return f"{base}/mcp" if base else "/mcp"
 
@@ -182,6 +175,7 @@ def _resource_url(request: Request) -> str:
 @app.get("/.well-known/oauth-protected-resource/mcp")
 def oauth_protected_resource(request: Request):
     issuer = _normalized_issuer_from_env()
+
     return {
         "resource": _resource_url(request),
         "authorization_servers": [issuer] if issuer else [],
@@ -202,11 +196,7 @@ def oauth_authorization_server():
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "scopes_supported": _supported_scopes(),
-        "token_endpoint_auth_methods_supported": [
-            "client_secret_post",
-            "client_secret_basic",
-            "none",
-        ],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic", "none"],
     }
 
 
@@ -226,18 +216,13 @@ def openid_configuration():
     }
 
 
-# -----------------------------------------------------------------------------
-# MCP mount + OAuth enforcement wrapper
-# -----------------------------------------------------------------------------
-class MCPHttpOAuthWrapper:
-    """
-    ASGI wrapper that enforces OAuth for MCP requests.
+# ---------------------------------------------------------------------------
+# MCP mount + OAuth enforcement (HTTP-level)
+# ---------------------------------------------------------------------------
 
-    Key behavior:
-    - On 401, include `WWW-Authenticate: Bearer resource_metadata="..."` so
-      the client can discover the protected resource metadata endpoint.
-    - Allow safe tool discovery without OAuth if ALLOW_PUBLIC_DISCOVERY=1.
-    """
+
+class MCPHttpOAuthWrapper:
+    """ASGI wrapper that enforces OAuth for MCP requests."""
 
     def __init__(self, asgi_app: Any):
         self._app = asgi_app
@@ -250,6 +235,7 @@ class MCPHttpOAuthWrapper:
             payload = json.loads(body.decode("utf-8"))
         except Exception:
             return []
+
         msgs = payload if isinstance(payload, list) else [payload]
         methods: list[str] = []
         for msg in msgs:
@@ -299,7 +285,9 @@ class MCPHttpOAuthWrapper:
         else:
             base = ""
 
-        resource_metadata_url = f"{base}/.well-known/oauth-protected-resource" if base else "/.well-known/oauth-protected-resource"
+        resource_metadata_url = (
+            f"{base}/.well-known/oauth-protected-resource" if base else "/.well-known/oauth-protected-resource"
+        )
         scope_str = " ".join(_supported_scopes())
 
         www_auth = f'Bearer resource_metadata="{resource_metadata_url}"'
@@ -312,48 +300,34 @@ class MCPHttpOAuthWrapper:
             await self._app(scope, receive, send)
             return
 
+        body_buf = self._BodyBuffer(receive)
+
         path = (scope.get("path") or "").rstrip("/")
 
-        # Only protect MCP transport endpoints
+        # Enforce OAuth only for MCP transport endpoints.
         if not (path == "/mcp" or path.startswith("/mcp/") or path == "/sse" or path.startswith("/sse/")):
             await self._app(scope, receive, send)
             return
 
-        # Some clients probe MCP with GET /mcp. Return 200 to keep UX stable.
-        if scope.get("method") == "GET" and (path == "/mcp" or path == "/mcp/"):
-            resp = JSONResponse({"ok": True, "message": "MCP endpoint ready. Use POST for JSON-RPC."})
-            await resp(scope, receive, send)
-            return
-
-        body_buf = self._BodyBuffer(receive)
-
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in (scope.get("headers") or [])}
         auth = headers.get("authorization")
 
-        # ✅ IMPORTANT: define this (fixes NameError)
         allow_public_discovery = os.environ.get("ALLOW_PUBLIC_DISCOVERY", "1").lower() in {"1", "true", "yes"}
 
-        # Allow safe discovery methods without OAuth
-        if allow_public_discovery and (not auth or not auth.lower().startswith("bearer ")):
+        # ✅ IMPORTANT: public discovery should ONLY apply to /mcp (NOT /sse)
+        if allow_public_discovery and (not auth or not auth.lower().startswith("bearer ")) and path.startswith("/mcp"):
             try:
                 body = await body_buf.body()
 
-                # Empty POST probe: respond 200 instead of forcing auth.
-                if not body:
+                # ✅ Only treat empty-body as a probe for POST /mcp (not GET /sse)
+                if not body and scope.get("method") == "POST":
                     resp = JSONResponse({"ok": True, "message": "MCP endpoint ready. Send JSON-RPC methods via POST."})
                     await resp(scope, receive, send)
                     return
 
                 methods = self._extract_jsonrpc_methods(body)
 
-                public_methods = {
-                    "initialize",
-                    "tools/list",
-                    "resources/list",
-                    "prompts/list",
-                    "logging/setLevel",
-                    "ping",
-                }
+                public_methods = {"initialize", "tools/list", "resources/list", "prompts/list", "logging/setLevel", "ping"}
 
                 def _is_public_method(m: str) -> bool:
                     return m in public_methods or m.startswith("notifications/")
@@ -362,9 +336,9 @@ class MCPHttpOAuthWrapper:
                     await self._app(scope, body_buf.replay, send)
                     return
             except Exception:
-                pass  # fall back to auth enforcement
+                pass
 
-        # Expected audience/resource
+        # Expected audience/resource MUST match the configured MCP URL
         expected_resource = None
         try:
             proto = headers.get("x-forwarded-proto") or scope.get("scheme") or "https"
@@ -384,10 +358,26 @@ class MCPHttpOAuthWrapper:
             claims = await verify_bearer_token(auth, audience=expected_resource)
         except PermissionError as e:
             logger.info("MCP auth rejected: path=%s expected_audience=%s reason=%s", path, expected_resource, str(e))
+
+            challenge = self._challenge_headers(scope)
+
+            # ✅ CRITICAL FIX:
+            # ChatGPT may open an SSE connection during “refresh actions”.
+            # If we respond with JSON here, the client complains because it expects `text/event-stream`.
+            if path == "/sse" or path.startswith("/sse/"):
+                resp = Response(
+                    "event: error\ndata: unauthorized\n\n",
+                    status_code=401,
+                    media_type="text/event-stream",
+                    headers=challenge,
+                )
+                await resp(scope, receive, send)
+                return
+
             resp = JSONResponse(
                 {"error": "unauthorized", "error_description": str(e)},
                 status_code=401,
-                headers=self._challenge_headers(scope),
+                headers=challenge,
             )
             await resp(scope, receive, send)
             return
@@ -397,7 +387,6 @@ class MCPHttpOAuthWrapper:
             await resp(scope, receive, send)
             return
 
-        # Attach user context for tool handlers
         token = current_user.set({"sub": claims.get("sub"), "email": claims.get("email")})
         try:
             await self._app(scope, body_buf.replay, send)
@@ -405,9 +394,6 @@ class MCPHttpOAuthWrapper:
             current_user.reset(token)
 
 
-# -----------------------------------------------------------------------------
-# MCP mounting
-# IMPORTANT: FastMCP streamable_http_app already serves /mcp internally.
-# Mount at root so /mcp is exactly /mcp (not /mcp/mcp).
-# -----------------------------------------------------------------------------
+# IMPORTANT: FastMCP's HTTP transport already exposes /mcp (and /sse).
+# Mount at root so /mcp stays /mcp (not /mcp/mcp).
 app.mount("/", MCPHttpOAuthWrapper(mcp.streamable_http_app()))
