@@ -48,7 +48,8 @@ app.add_middleware(
     https_only=True,
 )
 
-from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
 
 app.include_router(ui_router)
