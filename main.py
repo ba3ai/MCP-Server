@@ -21,46 +21,41 @@ from app import db
 from app.request_context import current_user
 from app.ui import router as ui_router
 from app.mcp_app import mcp
-from fastapi import Request
+
 load_dotenv()
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("qbo_mcp")
 
-# NOTE: Avoid auto-redirects (307) caused by missing/extra trailing slashes.
-# Some clients drop the Authorization header when following redirects.
+
+# -----------------------------------------------------------------------------
+# Lifespan: FastMCP Streamable HTTP requires session_manager.run()
+# -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
-    # Initialize FastMCP Streamable HTTP session manager.
-    # Without this, FastMCP raises: 'Task group is not initialized. Make sure to use run().' 
     async with mcp.session_manager.run():
         await init_db()
         yield
 
 
+# NOTE: Avoid auto-redirects (307) caused by missing/extra trailing slashes.
+# Some clients drop Authorization header when following redirects.
 app = FastAPI(redirect_slashes=False, lifespan=lifespan)
 
-
+# Sessions for /ui
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.environ.get("SESSION_SECRET", "change-me"),
     same_site="lax",
-    https_only=True,
+    https_only=(os.environ.get("HTTPS_ONLY", "true").lower() in {"1", "true", "yes"}),
 )
 
 app.include_router(ui_router)
 
 
-@app.get("/__debug")
-def __debug(request: Request):
-    return {
-        "host": request.headers.get("host"),
-        "x_forwarded_host": request.headers.get("x-forwarded-host"),
-        "x_forwarded_proto": request.headers.get("x-forwarded-proto"),
-        "render_git_commit": os.environ.get("RENDER_GIT_COMMIT"),
-        "marker": "MCP-SERVER-DEBUG-2026-02-25",
-    }
-
+# -----------------------------------------------------------------------------
+# Basic routes
+# -----------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {"ok": True, "service": "QBO MCP Server (OAuth + UI)", "ui": "/ui", "mcp": "/mcp"}
@@ -71,6 +66,9 @@ def health():
     return {"ok": True}
 
 
+# -----------------------------------------------------------------------------
+# Intuit OAuth helpers (your existing flow)
+# -----------------------------------------------------------------------------
 @app.get("/intuit/connect")
 def intuit_connect(state: str):
     return RedirectResponse(build_intuit_auth_url(state=state))
@@ -96,19 +94,12 @@ async def intuit_callback(code: str, realmId: str, state: str):
     return JSONResponse({"connected": True, "realmId": realmId, "user_id": user_id})
 
 
-# ---------------------------------------------------------------------------
-# OAuth discovery endpoints (required for ChatGPT Custom Connector OAuth mode)
-# ---------------------------------------------------------------------------
-
-
+# -----------------------------------------------------------------------------
+# OAuth discovery endpoints (for ChatGPT Custom Connector OAuth mode)
+# -----------------------------------------------------------------------------
 def _normalized_issuer_from_env() -> Optional[str]:
-    """Return issuer (with trailing slash if it's a domain-based issuer).
-
-    Auth0 issuers typically include a trailing slash.
-    """
     issuer = os.environ.get("OIDC_ISSUER")
     if issuer:
-        # Preserve Auth0/OIDC conventions, but ensure a single trailing slash.
         return issuer.rstrip("/") + "/"
 
     dom = os.environ.get("OAUTH_ISSUER_DOMAIN")
@@ -149,8 +140,6 @@ def _jwks_uri() -> Optional[str]:
 
 
 def _registration_endpoint() -> Optional[str]:
-    # If your IdP supports OIDC Dynamic Client Registration (DCR), set this.
-    # Auth0's DCR endpoint is typically /oidc/register when enabled.
     ep = os.environ.get("OIDC_REGISTRATION_ENDPOINT")
     if ep:
         return ep
@@ -161,54 +150,38 @@ def _registration_endpoint() -> Optional[str]:
 
 
 def _supported_scopes() -> list[str]:
-    # ChatGPT's OAuth client can be strict about requested vs. granted scopes.
-    # Prefer standard OIDC scopes by default unless you explicitly configure
-    # custom scopes in your IdP.
     raw = os.environ.get("OAUTH_SCOPES", "openid profile email offline_access")
     return [s for s in raw.replace(",", " ").split() if s]
 
 
 def _public_base_url_from_request(request: Request) -> str:
-    # Prefer explicit env for stability behind proxies.
-    env_url = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+    env_url = (
+        os.environ.get("PUBLIC_BASE_URL")
+        or os.environ.get("BASE_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+    )
     if env_url:
         return env_url.rstrip("/")
 
-    # Fall back to request-derived.
     host = request.headers.get("x-forwarded-host") or request.headers.get("host")
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme
     if host:
         return f"{proto}://{host}".rstrip("/")
-
     return ""
 
 
 def _resource_url(request: Request) -> str:
-    """Return the resource identifier (RFC 9728) for this MCP server.
-
-    IMPORTANT: The `resource` MUST match the MCP server URL that the client
-    configured (e.g. https://host/mcp). Many MCP clients validate this.
-    """
-
-    # If explicitly configured, trust the env value.
     resource = os.environ.get("OAUTH_RESOURCE")
     if resource:
         return resource.rstrip("/")
-
     base = _public_base_url_from_request(request).rstrip("/")
-    # Our MCP endpoint is /mcp (served by the FastMCP HTTP transport).
     return f"{base}/mcp" if base else "/mcp"
 
 
 @app.get("/.well-known/oauth-protected-resource")
 @app.get("/.well-known/oauth-protected-resource/mcp")
 def oauth_protected_resource(request: Request):
-    """Protected Resource Metadata (RFC 9728).
-
-    ChatGPT uses this to discover your authorization server(s) and scopes.
-    """
     issuer = _normalized_issuer_from_env()
-
     return {
         "resource": _resource_url(request),
         "authorization_servers": [issuer] if issuer else [],
@@ -220,11 +193,6 @@ def oauth_protected_resource(request: Request):
 
 @app.get("/.well-known/oauth-authorization-server")
 def oauth_authorization_server():
-    """OAuth Authorization Server Metadata (RFC 8414).
-
-    Note: In a typical deployment, this lives on the authorization server domain.
-    We expose it here as well because some MCP clients expect it on the same host.
-    """
     return {
         "issuer": _normalized_issuer_from_env(),
         "authorization_endpoint": _authorization_endpoint(),
@@ -235,7 +203,6 @@ def oauth_authorization_server():
         "code_challenge_methods_supported": ["S256"],
         "scopes_supported": _supported_scopes(),
         "token_endpoint_auth_methods_supported": [
-            # Common options; the real supported methods depend on your IdP.
             "client_secret_post",
             "client_secret_basic",
             "none",
@@ -259,19 +226,17 @@ def openid_configuration():
     }
 
 
-# ---------------------------------------------------------------------------
-# MCP mount + OAuth enforcement (HTTP-level)
-# ---------------------------------------------------------------------------
-
-
+# -----------------------------------------------------------------------------
+# MCP mount + OAuth enforcement wrapper
+# -----------------------------------------------------------------------------
 class MCPHttpOAuthWrapper:
-    """ASGI wrapper that enforces OAuth for MCP requests.
+    """
+    ASGI wrapper that enforces OAuth for MCP requests.
 
-    Key behavior for ChatGPT:
-    - On 401, include `WWW-Authenticate: Bearer resource_metadata="..."` so the
-      client can discover the protected resource metadata endpoint.
-
-    See OpenAI Apps SDK docs for the expected challenge format.
+    Key behavior:
+    - On 401, include `WWW-Authenticate: Bearer resource_metadata="..."` so
+      the client can discover the protected resource metadata endpoint.
+    - Allow safe tool discovery without OAuth if ALLOW_PUBLIC_DISCOVERY=1.
     """
 
     def __init__(self, asgi_app: Any):
@@ -279,20 +244,12 @@ class MCPHttpOAuthWrapper:
 
     @staticmethod
     def _extract_jsonrpc_methods(body: bytes) -> list[str]:
-        """Best-effort extraction of JSON-RPC method(s) from an MCP request body.
-
-        Handles:
-        - single JSON-RPC request objects
-        - JSON-RPC batch requests (list of objects)
-        - notifications (no "id")
-        """
         if not body:
             return []
         try:
             payload = json.loads(body.decode("utf-8"))
         except Exception:
             return []
-
         msgs = payload if isinstance(payload, list) else [payload]
         methods: list[str] = []
         for msg in msgs:
@@ -303,8 +260,6 @@ class MCPHttpOAuthWrapper:
         return methods
 
     class _BodyBuffer:
-        """Buffer the ASGI body so it can be read and then replayed."""
-
         def __init__(self, receive):
             self._receive = receive
             self._body: Optional[bytes] = None
@@ -326,7 +281,6 @@ class MCPHttpOAuthWrapper:
             return self._body
 
         async def replay(self):
-            # If we never read the body, just pass through.
             if self._queue is None:
                 return await self._receive()
             if self._queue:
@@ -334,7 +288,6 @@ class MCPHttpOAuthWrapper:
             return {"type": "http.request", "body": b"", "more_body": False}
 
     def _challenge_headers(self, scope: Dict[str, Any]) -> Dict[str, str]:
-        # Build an absolute resource metadata URL when possible.
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in (scope.get("headers") or [])}
         proto = headers.get("x-forwarded-proto") or scope.get("scheme") or "https"
         host = headers.get("x-forwarded-host") or headers.get("host")
@@ -346,17 +299,12 @@ class MCPHttpOAuthWrapper:
         else:
             base = ""
 
-        # Prefer root metadata URL. We also serve a path-qualified variant at
-        # /.well-known/oauth-protected-resource/mcp for compatibility.
-        resource_metadata_url = (
-            f"{base}/.well-known/oauth-protected-resource" if base else "/.well-known/oauth-protected-resource"
-        )
+        resource_metadata_url = f"{base}/.well-known/oauth-protected-resource" if base else "/.well-known/oauth-protected-resource"
         scope_str = " ".join(_supported_scopes())
 
         www_auth = f'Bearer resource_metadata="{resource_metadata_url}"'
         if scope_str:
             www_auth += f', scope="{scope_str}"'
-
         return {"WWW-Authenticate": www_auth}
 
     async def __call__(self, scope, receive, send):
@@ -364,29 +312,48 @@ class MCPHttpOAuthWrapper:
             await self._app(scope, receive, send)
             return
 
-        body_buf = self._BodyBuffer(receive)
-
         path = (scope.get("path") or "").rstrip("/")
 
-        # Some clients probe MCP with GET /mcp. Return a simple 200 instead of forcing OAuth.
-        if scope.get("method") == "GET" and (path == "" or path == "/"):
-            resp = JSONResponse({"ok": True, "message": "MCP endpoint. Use POST for JSON-RPC."})
+        # Only protect MCP transport endpoints
+        if not (path == "/mcp" or path.startswith("/mcp/") or path == "/sse" or path.startswith("/sse/")):
+            await self._app(scope, receive, send)
+            return
+
+        # Some clients probe MCP with GET /mcp. Return 200 to keep UX stable.
+        if scope.get("method") == "GET" and (path == "/mcp" or path == "/mcp/"):
+            resp = JSONResponse({"ok": True, "message": "MCP endpoint ready. Use POST for JSON-RPC."})
             await resp(scope, receive, send)
             return
+
+        body_buf = self._BodyBuffer(receive)
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in (scope.get("headers") or [])}
         auth = headers.get("authorization")
 
-        # Some hosts fetch MCP metadata / tool lists for UI display without attaching an
-        # access token. Tool discovery is safe to expose publicly.
+        # ✅ IMPORTANT: define this (fixes NameError)
+        allow_public_discovery = os.environ.get("ALLOW_PUBLIC_DISCOVERY", "1").lower() in {"1", "true", "yes"}
+
+        # Allow safe discovery methods without OAuth
         if allow_public_discovery and (not auth or not auth.lower().startswith("bearer ")):
             try:
-                methods = self._extract_jsonrpc_methods(await body_buf.body())
+                body = await body_buf.body()
 
-                # Only allow a small, safe subset of MCP methods without OAuth.
-                # IMPORTANT: Handle JSON-RPC batches safely (every method in the
-                # batch must be allow-listed) to avoid auth bypass.
-                public_methods = {"initialize", "tools/list", "resources/list", "prompts/list", "logging/setLevel", "ping"}
+                # Empty POST probe: respond 200 instead of forcing auth.
+                if not body:
+                    resp = JSONResponse({"ok": True, "message": "MCP endpoint ready. Send JSON-RPC methods via POST."})
+                    await resp(scope, receive, send)
+                    return
+
+                methods = self._extract_jsonrpc_methods(body)
+
+                public_methods = {
+                    "initialize",
+                    "tools/list",
+                    "resources/list",
+                    "prompts/list",
+                    "logging/setLevel",
+                    "ping",
+                }
 
                 def _is_public_method(m: str) -> bool:
                     return m in public_methods or m.startswith("notifications/")
@@ -395,17 +362,13 @@ class MCPHttpOAuthWrapper:
                     await self._app(scope, body_buf.replay, send)
                     return
             except Exception:
-                # Fall back to normal auth enforcement.
-                pass
+                pass  # fall back to auth enforcement
 
-        # The token's audience/resource MUST match the MCP URL the client uses.
-        # Compute the expected resource from the request headers.
+        # Expected audience/resource
         expected_resource = None
         try:
-            # Reuse logic from _challenge_headers.
-            hdrs = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in (scope.get("headers") or [])}
-            proto = hdrs.get("x-forwarded-proto") or scope.get("scheme") or "https"
-            host = hdrs.get("x-forwarded-host") or hdrs.get("host")
+            proto = headers.get("x-forwarded-proto") or scope.get("scheme") or "https"
+            host = headers.get("x-forwarded-host") or headers.get("host")
             base = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
             if base:
                 base = base.rstrip("/")
@@ -434,22 +397,17 @@ class MCPHttpOAuthWrapper:
             await resp(scope, receive, send)
             return
 
-        # Attach user context for tool handlers.
+        # Attach user context for tool handlers
         token = current_user.set({"sub": claims.get("sub"), "email": claims.get("email")})
         try:
             await self._app(scope, body_buf.replay, send)
         finally:
-            # Avoid leaking identity across requests.
             current_user.reset(token)
 
 
-# ---------------------------------------------------------------------------
-# MCP transport mounting
-#
-# IMPORTANT: FastMCP's HTTP transport already exposes the /mcp (and /sse) paths.
-# Mount it at the root and let FastAPI's explicit routes above take precedence.
-# This avoids /mcp -> /mcp/ redirects and "double /mcp" path issues.
-# ---------------------------------------------------------------------------
-
-# ✅ Correct
+# -----------------------------------------------------------------------------
+# MCP mounting
+# IMPORTANT: FastMCP streamable_http_app already serves /mcp internally.
+# Mount at root so /mcp is exactly /mcp (not /mcp/mcp).
+# -----------------------------------------------------------------------------
 app.mount("/", MCPHttpOAuthWrapper(mcp.streamable_http_app()))
